@@ -99,7 +99,8 @@ import warnings
 
 # Import all pipeline modules from the src/ package
 from src.ingestion import load_and_flatten_json, clean_and_resample
-from src.features import build_internal_features, merge_external_factors
+from src.features import build_internal_features, merge_external_factors, join_static_metadata
+from src.metadata import fetch_api_skins, extract_api_features
 from src.training import MultiHorizonTrainer
 from src.inference import QuantileInferenceEngine
 from src.tuning import HyperparameterOptimizer
@@ -177,7 +178,7 @@ def compute_targets(df: pd.DataFrame, horizons: list) -> dict:
     return y_dict
 
 
-def prepare_pipeline(file_path: str, horizons: list) -> tuple:
+def prepare_pipeline(file_path: str, horizons: list, metadata_df: pd.DataFrame = None) -> tuple:
     """
     Executes the full data preparation pipeline for one JSON dataset.
 
@@ -190,7 +191,8 @@ def prepare_pipeline(file_path: str, horizons: list) -> tuple:
     2. Resample to daily frequency and fill short gaps (ingestion.py)
     3. Compute all technical indicator features (features.py)
     4. Simulate and merge external macro factors (features.py)
-    5. Compute target returns for all horizons (this file)
+    5. Join static API metadata (features.py)
+    6. Compute target returns for all horizons (this file)
 
     Parameters
     ----------
@@ -201,6 +203,10 @@ def prepare_pipeline(file_path: str, horizons: list) -> tuple:
 
     horizons : list of int
         Forecast horizons. Targets are computed for each.
+
+    metadata_df : pd.DataFrame, optional
+        Static metadata from the CSGO API (rarity, float caps, etc.).
+        Indexed by item_name. If None, metadata join is skipped.
 
     Returns
     -------
@@ -249,7 +255,12 @@ def prepare_pipeline(file_path: str, horizons: list) -> tuple:
     # Merge external factors into the feature matrix
     df = merge_external_factors(df, liquidity_df, player_count_df)
 
-    # Step 5: Compute percentage return targets for each horizon
+    # Step 5: Join static API metadata if available
+    if metadata_df is not None:
+        print("Joining API metadata...")
+        df = join_static_metadata(df, metadata_df)
+
+    # Step 6: Compute percentage return targets for each horizon
     y_dict = compute_targets(df, horizons)
 
     # Remove non-feature columns from X; keep them in df for visualization
@@ -276,7 +287,15 @@ def main():
     os.makedirs('output', exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # STAGE 1: Choose Forecast Horizons
+    # STAGE 1: Fetch API Metadata
+    # -----------------------------------------------------------------------
+    print("\n--- Fetching API Metadata ---")
+    raw_api_df = fetch_api_skins()
+    metadata_df = extract_api_features(raw_api_df)
+    print(f"  Extracted metadata for {len(metadata_df)} item name variants")
+
+    # -----------------------------------------------------------------------
+    # STAGE 2: Choose Forecast Horizons
     # -----------------------------------------------------------------------
     # See module docstring for explanation of why only [8] is used.
     # To experiment with other horizons, ensure you have 30+ extra days of data
@@ -284,18 +303,18 @@ def main():
     horizons = [8]
 
     # -----------------------------------------------------------------------
-    # STAGE 2: Prepare Training Data
+    # STAGE 3: Prepare Training Data
     # -----------------------------------------------------------------------
     # This runs the full ingestion → feature engineering pipeline on the
     # training JSON file. X_train contains the feature matrix; y_train_dict
     # contains the target returns; df_train contains the full DataFrame
     # (used later for visualization with item metadata).
     X_train, y_train_dict, df_train = prepare_pipeline(
-        'data/model_training_skin.json', horizons
+        'data/model_training_skin.json', horizons, metadata_df=metadata_df
     )
 
     # -----------------------------------------------------------------------
-    # STAGE 3: Hyperparameter Optimization
+    # STAGE 4: Hyperparameter Optimization
     # -----------------------------------------------------------------------
     # Run Bayesian optimization to find the best LightGBM configuration.
     # `groups=X_train['item_name']` passes item names to GroupKFold so
@@ -306,7 +325,15 @@ def main():
     # Separate the item identifier and price columns from features
     # (the model should not see 'item_name' or 'spot_price' as input features)
     groups = X_train['item_name']
+    # Drop non-feature columns: item_name, spot_price, and string metadata cols
+    # String metadata (collection, weapon_name) are kept for LightGBM categorical
+    # handling in training.py but must be converted to category dtype here too
     X_train_features = X_train.drop(columns=['item_name', 'spot_price'], errors='ignore')
+
+    # Convert string columns to category dtype for LightGBM compatibility
+    cat_cols = X_train_features.select_dtypes(include=['object']).columns.tolist()
+    for col in cat_cols:
+        X_train_features[col] = X_train_features[col].astype('category')
 
     best_params = optimizer.optimize(X_train_features, y_train_dict[8], groups=groups)
 
@@ -318,8 +345,7 @@ def main():
     # (used for SHAP visualization, not for the final inference predictions)
     best_model = optimizer.get_best_model(X_train_features, y_train_dict[8])
 
-    # -----------------------------------------------------------------------
-    # STAGE 4: Multi-Algorithm Training
+    # -----------------------------------------------------------------------\n    # STAGE 5: Multi-Algorithm Training
     # -----------------------------------------------------------------------
     # Train all three algorithms (HistGBM, XGBoost, LightGBM) for the
     # 8-day horizon using their default hyperparameters.
@@ -329,7 +355,7 @@ def main():
     trainer.train_models(X_train_features, y_train_dict)
 
     # -----------------------------------------------------------------------
-    # STAGE 5: Quantile Inference Training
+    # STAGE 6: Quantile Inference Training
     # -----------------------------------------------------------------------
     # Train the probabilistic (P5/P50/P95) models using LightGBM quantile
     # regression. This is separate from the point-estimate models above.
@@ -337,15 +363,20 @@ def main():
     inference_engine.fit_horizon(X_train_features, y_train_dict[8], horizon=8)
 
     # -----------------------------------------------------------------------
-    # STAGE 6: Prepare Test Data
+    # STAGE 7: Prepare Test Data
     # -----------------------------------------------------------------------
     # Run the same ingestion + feature engineering pipeline on the test set.
     # The test set is temporally distinct from the training set — no overlap.
     print("\n--- Processing Test Set ---")
     X_test, y_test_dict, df_test = prepare_pipeline(
-        'data/model_test_skin.json', horizons
+        'data/model_test_skin.json', horizons, metadata_df=metadata_df
     )
     X_test_features = X_test.drop(columns=['item_name', 'spot_price'], errors='ignore')
+
+    # Convert string columns to category dtype (must match training schema)
+    for col in cat_cols:
+        if col in X_test_features.columns:
+            X_test_features[col] = X_test_features[col].astype('category')
 
     # -----------------------------------------------------------------------
     # STAGE 7: Inference & Evaluation on Test Data

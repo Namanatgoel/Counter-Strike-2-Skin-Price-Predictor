@@ -151,14 +151,16 @@ class QuantileInferenceEngine:
             return HistGradientBoostingRegressor(
                 loss='quantile',
                 quantile=alpha,
-                random_state=42
+                random_state=42,
+                categorical_features="from_dtype"
             )
         elif self.algo_name == 'xgboost':
             return XGBRegressor(
                 objective='reg:quantileerror',
                 quantile_alpha=alpha,
                 random_state=42,
-                n_jobs=-1
+                n_jobs=-1,
+                enable_categorical=True
             )
         elif self.algo_name == 'lightgbm':
             return LGBMRegressor(

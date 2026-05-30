@@ -248,25 +248,44 @@ def plot_shap_summary(
     for i, feature_idx in enumerate(top_indices):
         feature_name = X_train.columns[feature_idx]
         shap_vals    = shap_values[:, feature_idx]          # SHAP values for this feature
-        feature_vals = X_train.iloc[:, feature_idx].values  # raw feature values (for coloring)
+        
+        feature_series = X_train.iloc[:, feature_idx]
+        
+        # Plotly requires numeric values for continuous colorscales
+        if pd.api.types.is_numeric_dtype(feature_series):
+            feature_vals = feature_series.values
+            hover_text = None
+            hovertemplate = (
+                f'<b>{feature_name}</b><br>'
+                'SHAP: %{x:.4f}<br>'
+                'Feature Value: %{marker.color:.4f}'
+                '<extra></extra>'
+            )
+        else:
+            # Convert categorical/string columns to integer codes for coloring
+            cat_series = feature_series.astype('category')
+            feature_vals = cat_series.cat.codes.values
+            hover_text = cat_series.astype(str).values
+            hovertemplate = (
+                f'<b>{feature_name}</b><br>'
+                'SHAP: %{x:.4f}<br>'
+                'Feature Value: %{text}'
+                '<extra></extra>'
+            )
 
         fig.add_trace(go.Scatter(
             x=shap_vals,                         # horizontal position = prediction impact
             y=[feature_name] * len(shap_vals),   # all dots for this feature at same y
             mode='markers',
             name=feature_name,
+            text=hover_text,
             marker=dict(
                 size=5,
                 color=feature_vals,              # color encodes the feature's raw value
                 colorscale='Viridis',            # purple=low, yellow=high
                 showscale=(i == 0)               # only show the colorbar for the first trace
             ),
-            hovertemplate=(
-                f'<b>{feature_name}</b><br>'
-                'SHAP: %{x:.4f}<br>'
-                'Feature Value: %{marker.color:.4f}'
-                '<extra></extra>'
-            )
+            hovertemplate=hovertemplate
         ))
 
     # --- Layout ---

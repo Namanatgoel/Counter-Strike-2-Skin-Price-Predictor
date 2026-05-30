@@ -438,3 +438,75 @@ def merge_external_factors(
     merged = merged.ffill(limit=2).fillna(merged.median(numeric_only=True))
 
     return merged
+
+
+def join_static_metadata(
+    df: pd.DataFrame,
+    metadata_df: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Left-joins static game metadata (rarity, float caps, collection, etc.)
+    onto the time-series price DataFrame.
+
+    Static metadata columns are constant for a given item — they do not
+    change over time. The join broadcasts each item's metadata across all
+    of that item's chronological rows.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature-engineered DataFrame from `build_internal_features` or
+        `merge_external_factors`. Must contain an 'item_name' column.
+        Index is a DatetimeIndex.
+
+    metadata_df : pd.DataFrame
+        Static metadata DataFrame from `extract_api_features()`.
+        Indexed by `item_name`. Columns include:
+        'rarity_ordinal', 'is_stattrak', 'is_souvenir', 'min_float',
+        'max_float', 'float_range', 'collection', 'weapon_name'.
+
+    Returns
+    -------
+    pd.DataFrame
+        Original DataFrame with metadata columns appended via left join.
+        Items not found in the API metadata will have NaN for metadata
+        columns, which are filled with defaults:
+        - Numeric columns: filled with 0
+        - String columns ('collection', 'weapon_name'): filled with 'Unknown'
+
+    Notes on Join Strategy
+    ----------------------
+    The join is performed on the 'item_name' column (not the index) because
+    the main DataFrame's index is a DatetimeIndex. `metadata_df` is indexed
+    by item_name, so we use `df['item_name'].map(metadata_df[col])` for
+    efficient broadcasting without resetting indices.
+    """
+    # Join each metadata column individually via .map() on item_name
+    # This is more robust than merge() when the main df has a DatetimeIndex
+    for col in metadata_df.columns:
+        df[col] = df['item_name'].map(metadata_df[col])
+
+    # Fill missing metadata for items not found in the API
+    numeric_meta_cols = [
+        'rarity_ordinal', 'is_stattrak', 'is_souvenir',
+        'min_float', 'max_float', 'float_range'
+    ]
+    for col in numeric_meta_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    string_meta_cols = ['collection', 'weapon_name']
+    for col in string_meta_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna('Unknown')
+
+    # Report join coverage
+    matched = df['item_name'].isin(metadata_df.index).sum()
+    total = len(df)
+    unique_matched = df.loc[df['item_name'].isin(metadata_df.index), 'item_name'].nunique()
+    unique_total = df['item_name'].nunique()
+    print(f"  Metadata join: {unique_matched}/{unique_total} unique items matched "
+          f"({matched}/{total} rows)")
+
+    return df
+

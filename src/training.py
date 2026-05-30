@@ -168,7 +168,10 @@ class MultiHorizonTrainer:
             # - Uses histogram-based splits (fast, memory-efficient)
             # - Natively handles NaN without preprocessing
             # - Default loss is squared error, appropriate for regression
-            return HistGradientBoostingRegressor(random_state=42)
+            return HistGradientBoostingRegressor(
+                random_state=42,
+                categorical_features="from_dtype"
+            )
 
         elif algo_name == 'xgboost':
             # XGBRegressor:
@@ -178,7 +181,8 @@ class MultiHorizonTrainer:
             return XGBRegressor(
                 random_state=42,
                 n_jobs=-1,
-                objective='reg:squarederror'
+                objective='reg:squarederror',
+                enable_categorical=True
             )
 
         elif algo_name == 'lightgbm':
@@ -255,6 +259,13 @@ class MultiHorizonTrainer:
 
                 # Instantiate a fresh, unfitted model
                 model = self._get_base_estimator(algo)
+
+                # Convert string columns to pandas category dtype so that
+                # LightGBM can use native categorical splits (more efficient
+                # and accurate than one-hot encoding for high-cardinality features)
+                cat_cols = X_train.select_dtypes(include=['object']).columns.tolist()
+                for col in cat_cols:
+                    X_train[col] = X_train[col].astype('category')
 
                 # Fit: this is where actual learning happens
                 model.fit(X_train, y_train)
