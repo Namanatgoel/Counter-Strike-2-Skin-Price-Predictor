@@ -2,5 +2,6 @@ CS2_skin_predictor_synopsis.txt
 data/model_training.json
 data/model_test_skin.json
 data/model_training_skin.json
+data/api_skins_cache.json
 __pycache__/
 *.pyc

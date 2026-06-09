@@ -7,3 +7,4 @@ optuna
 ujson
 plotly
 shap
+openpyxl

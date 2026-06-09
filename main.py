@@ -434,6 +434,44 @@ def main():
     print(f"  Directional Accuracy:    {dir_acc:.2f}%")
 
     # -----------------------------------------------------------------------
+    # OUTPUT: Save predictions to Excel (or CSV fallback)
+    # -----------------------------------------------------------------------
+    # Construct a tidy DataFrame with one row per prediction containing:
+    # - item name, current date, predicted future date, current price
+    # - true future price (from test set), P5/P50/P95 and confidence
+    try:
+        output_df = predictions.copy()
+        # Attach identifying columns from the test set (aligned to valid_idx)
+        output_df['item_name'] = items_valid.values
+        output_df['current_date'] = output_df.index
+        # Predictions are for t + horizon days
+        output_df['predicted_date'] = output_df.index + pd.Timedelta(days=8)
+        output_df['current_price'] = prices_valid.values
+        output_df['true_price'] = true_prices.values
+
+        # Reorder columns for readability
+        cols = [
+            'item_name', 'current_date', 'predicted_date', 'current_price',
+            'true_price', 'P5', 'Prediction_P50', 'P95', 'Confidence_Score'
+        ]
+        # Some columns may be missing in edge cases; filter to available ones
+        cols = [c for c in cols if c in output_df.columns]
+        output_df = output_df[cols]
+
+        os.makedirs('output', exist_ok=True)
+        xlsx_path = os.path.join('output', 'predictions.xlsx')
+        try:
+            output_df.to_excel(xlsx_path, index=False)
+            print(f"  Excel predictions saved to {xlsx_path}")
+        except Exception as e:
+            # If Excel writer not available, fall back to CSV
+            csv_path = os.path.join('output', 'predictions.csv')
+            output_df.to_csv(csv_path, index=False)
+            print(f"  Could not write Excel file ({e}); saved CSV to {csv_path}")
+    except Exception as e:
+        print(f"  Warning: failed to assemble predictions output: {e}")
+
+    # -----------------------------------------------------------------------
     # STAGE 8: Visualization
     # -----------------------------------------------------------------------
     # Select one random test item to visualize, then generate all 3 charts.
@@ -480,7 +518,7 @@ def main():
         output_path='output/volatility_regimes.html'
     )
 
-    print("\n✓ Pipeline Complete.")
+    print("\n Pipeline Complete.")
     print("  Outputs saved to output/:")
     print("    - forecast_intervals.html  (open in any web browser)")
     print("    - shap_summary.html        (open in any web browser)")

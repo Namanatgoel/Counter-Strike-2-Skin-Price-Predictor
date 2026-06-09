@@ -505,6 +505,39 @@ This chart shows price and volatility on the same timeline with high-volatility 
 
 ---
 
+### Excel / CSV Predictions Output
+
+The pipeline saves a tidy table of test-set predictions to `output/predictions.xlsx` (Excel) when an Excel writer is available. If the `openpyxl` package is not installed, the pipeline falls back to `output/predictions.csv` (CSV).
+
+File location:
+- `output/predictions.xlsx` or `output/predictions.csv`
+
+Columns included (one row per prediction):
+- `item_name`: item identifier used in the dataset
+- `current_date`: the date for which the model used features (ISO 8601 timestamp)
+- `predicted_date`: the forecast date (usually `current_date` + 8 days)
+- `current_price`: spot price at `current_date`
+- `true_price`: the actual observed price at `predicted_date` (if available)
+- `P5`: 5th-percentile predicted price (lower bound)
+- `Prediction_P50`: median predicted price (primary forecast)
+- `P95`: 95th-percentile predicted price (upper bound)
+- `Confidence_Score`: model confidence in [0.0, 1.0] (higher = narrower interval)
+
+Notes:
+- To enable Excel writing, make sure `openpyxl` is installed. It's included in `requirements.txt`; run:
+
+```bash
+pip install -r requirements.txt
+```
+
+- If Excel writing fails, the pipeline always writes `output/predictions.csv` as a compatible fallback.
+- You can load the file into pandas:
+
+```python
+import pandas as pd
+df = pd.read_excel('output/predictions.xlsx')  # or pd.read_csv('output/predictions.csv')
+```
+
 ## 9. The Complete Data Pipeline
 
 Here is every step the code executes, in order, with the exact function responsible:
@@ -795,6 +828,61 @@ X_train, y_train_dict, df_train = prepare_pipeline('data/YOUR_TRAINING_FILE.json
 X_test, y_test_dict, df_test = prepare_pipeline('data/YOUR_TEST_FILE.json', horizons)
 ```
 
+### Adding Your Own Data — Detailed Guide
+
+Where to place files
+- Put your datasets in the `data/` folder at the project root. The pipeline expects two files by default:
+  - `data/model_training_skin.json` — historical data used for training
+  - `data/model_test_skin.json`     — held-out recent data used for evaluation and inference
+
+File format and timestamps
+- Files must match the JSON nesting shown above. Keys for timestamps must be UNIX seconds as strings (e.g. "1716998400").
+- Each timestamp represents a daily price for that item on that `marketplace_name`.
+- The ingestion step resamples to one row per calendar day (keeps the last price for a day) and forward-fills up to 3 missing days. For best results provide daily or near-daily snapshots.
+
+How predictions map to your data
+- The model predicts a horizon `h` days ahead (default `h = 8`). For a row with `current_date = t`, the prediction refers to `predicted_date = t + h`.
+- The pipeline only evaluates predictions where the true observed price at `t + h` exists in your test dataset. In other words, if your last timestamp in `data/model_test_skin.json` is `D_last`, the latest `current_date` that can be evaluated is `D_last - h`.
+
+How many prediction days you will get
+- Let `T` be the number of calendar days present in your test dataset (after resampling). Let `W` be the warm-up days required for feature computation (this project uses `W = 20` for 20-day Bollinger Bands). Then the number of usable rows per item for a forecast horizon `h` is approximately:
+
+  usable_rows = T - W - h
+
+Examples:
+- If you provide 31 days of history (T=31), with W=20 and h=8 → usable_rows = 3 (this repo's default example)
+- To have 30 usable rows for h=8, you need T = 30 + 20 + 8 = 58 days of data
+
+If you want predictions for future dates beyond what exists in your test file
+- Option 1 (recommended): Extend `data/model_test_skin.json` with real prices up to the date you want evaluated. The pipeline will then produce evaluated predictions up to `D_last - h`.
+- Option 2 (forecast without true labels): If you only want point forecasts (no evaluation) for the most recent `current_date`s even though `t + h` is not present, you can run inference on all rows and accept that `true_price` will be NaN and metrics cannot be computed for those rows. To do this, edit `main.py` and replace the valid-mask at the evaluation step:
+
+```python
+# Original (only where true t+h exists):
+valid_idx = y_target_8d_ret.notna()
+
+# Predict for all rows (no true future required):
+valid_idx = pd.Series(True, index=X_test_features.index)
+```
+
+After this change the pipeline will still save `output/predictions.csv`/`.xlsx` containing forecasts for all `current_date`s; `true_price` will be empty for rows where `t + h` was not available.
+
+Changing the forecast horizon
+- The forecast horizon(s) are defined in `main.py` at the top of the `main()` flow. To change them edit:
+
+```python
+horizons = [8]
+```
+
+and replace with any list of integers, e.g. `horizons = [1, 3, 8]`.
+- Important: Increasing `h` requires more historical days (see usable_rows formula). If you set `h` greater than your available data permits, the computed targets will be mostly NaN and training/evaluation will fail or produce no usable rows.
+
+Practical tips
+- Start small: if you only have a subset of data, run the pipeline on `model_test_skin.json` alone to sanity-check ingestion and feature engineering.
+- Use longer history (60–120 days) when you want multi-horizon forecasts (1, 3, 8, 16 days). More history improves feature warm-up and stability.
+- Keep timestamps in UTC and use end-of-day or daily snapshots for consistency.
+- If you only want deployment-style forecasts (no evaluation), consider creating a thin `data/deploy.json` that contains the latest prices and run a small wrapper that loads the trained models and produces predictions without computing metrics (I can help scaffold this if you want).
+
 ---
 
 ## Quick Reference: All Commands
@@ -829,5 +917,3 @@ python main.py
 ```
 
 ---
-
-*This framework was built to be modular, extensible, and well-documented. Every design decision is explained in detail in the source code files themselves — look for the large comment blocks at the top of each file in the `src/` directory.*
