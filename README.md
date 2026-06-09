@@ -829,5 +829,3 @@ python main.py
 ```
 
 ---
-
-*This framework was built to be modular, extensible, and well-documented. Every design decision is explained in detail in the source code files themselves — look for the large comment blocks at the top of each file in the `src/` directory.*
