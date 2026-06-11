@@ -260,15 +260,24 @@ class MultiHorizonTrainer:
                 # Instantiate a fresh, unfitted model
                 model = self._get_base_estimator(algo)
 
+                # HistGradientBoosting cannot handle very high-cardinality
+                # categorical dtypes, so we feed it integer codes instead.
+                # XGBoost and LightGBM keep the categorical dtype.
+                X_model = X_train.copy()
+
                 # Convert string columns to pandas category dtype so that
                 # LightGBM can use native categorical splits (more efficient
                 # and accurate than one-hot encoding for high-cardinality features)
-                cat_cols = X_train.select_dtypes(include=['object']).columns.tolist()
-                for col in cat_cols:
-                    X_train[col] = X_train[col].astype('category')
+                cat_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
+                if algo == 'hist_gb':
+                    for col in cat_cols:
+                        X_model[col] = pd.Categorical(X_model[col].astype(str)).codes.astype('int32')
+                else:
+                    for col in cat_cols:
+                        X_model[col] = X_model[col].astype(str).astype('category')
 
                 # Fit: this is where actual learning happens
-                model.fit(X_train, y_train)
+                model.fit(X_model, y_train)
 
                 # Store the fitted model for later inference
                 self.models[algo][h] = model
@@ -277,7 +286,7 @@ class MultiHorizonTrainer:
                 # n_repeats=5: each feature is shuffled 5 times, results averaged
                 # n_jobs=-1: parallelized across CPU cores
                 result = permutation_importance(
-                    model, X_train, y_train,
+                    model, X_model, y_train,
                     n_repeats=5,
                     random_state=42,
                     n_jobs=-1
@@ -285,7 +294,7 @@ class MultiHorizonTrainer:
 
                 # Build a readable DataFrame sorted by importance descending
                 imp_df = pd.DataFrame({
-                    'feature': X_train.columns,
+                    'feature': X_model.columns,
                     'importance': result.importances_mean  # average over 5 shuffles
                 }).sort_values(by='importance', ascending=False)
 

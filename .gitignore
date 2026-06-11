@@ -5,3 +5,7 @@ data/model_training_skin.json
 data/api_skins_cache.json
 __pycache__/
 *.pyc
+*.zip
+data/
+!data/sample_empty.json
+

@@ -96,9 +96,10 @@ import pandas as pd
 import numpy as np
 import os
 import warnings
+import ujson
 
 # Import all pipeline modules from the src/ package
-from src.ingestion import load_and_flatten_json, clean_and_resample
+from src.ingestion import clean_and_resample
 from src.features import build_internal_features, merge_external_factors, join_static_metadata
 from src.metadata import fetch_api_skins, extract_api_features
 from src.training import MultiHorizonTrainer
@@ -114,6 +115,101 @@ warnings.filterwarnings('ignore')
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
+
+def load_training_json(file_path: str) -> pd.DataFrame:
+    """
+    Loads the current item-level JSON file and flattens it to tick data.
+
+    The new schema is keyed by item name at the top level. Each item stores
+    metadata fields such as `cat`, `variant`, `base`, and `rkey`, plus a
+    nested `providers` dictionary containing timestamped prices.
+    """
+    print(f"Loading {file_path}...")
+    with open(file_path, 'r') as file_handle:
+        data = ujson.load(file_handle)
+
+    records = []
+    if not data:
+        return pd.DataFrame(columns=['timestamp', 'category', 'item_name', 'marketplace_provider', 'spot_price'])
+
+    sample_value = next(iter(data.values()))
+    if isinstance(sample_value, dict) and 'providers' in sample_value:
+        for item_name, item_data in data.items():
+            item_metadata = {
+                key: value for key, value in item_data.items()
+                if key != 'providers' and not isinstance(value, dict)
+            }
+            category = item_metadata.pop('cat', item_metadata.pop('category', None))
+            providers = item_data.get('providers', {})
+
+            for provider, time_series in providers.items():
+                for ts, price in time_series.items():
+                    record = {
+                        'timestamp': pd.to_datetime(int(ts), unit='s'),
+                        'category': category,
+                        'item_name': item_name,
+                        'marketplace_provider': provider,
+                        'spot_price': float(price),
+                    }
+                    record.update(item_metadata)
+                    records.append(record)
+    else:
+        for category_name, category_data in data.items():
+            for item_name, providers in category_data.items():
+                for provider, time_series in providers.items():
+                    for ts, price in time_series.items():
+                        records.append({
+                            'timestamp': pd.to_datetime(int(ts), unit='s'),
+                            'category': category_name,
+                            'item_name': item_name,
+                            'marketplace_provider': provider,
+                            'spot_price': float(price),
+                        })
+
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+
+    df.set_index('timestamp', inplace=True)
+    df.sort_index(inplace=True)
+    return df
+
+
+def temporal_train_test_split(df: pd.DataFrame, train_ratio: float = 0.8) -> tuple:
+    """
+    Splits a time-indexed frame into chronological train and test sets.
+
+    The split is done on unique timestamps, not on individual rows, so all
+    items from the same day stay together in the same partition.
+    """
+    if df.empty:
+        raise ValueError('Cannot split an empty DataFrame.')
+
+    ordered_df = df.sort_index()
+    unique_timestamps = ordered_df.index.unique().sort_values()
+    if len(unique_timestamps) < 2:
+        raise ValueError('Need at least two unique timestamps to create a train/test split.')
+
+    split_position = int(len(unique_timestamps) * train_ratio)
+    split_position = max(1, min(len(unique_timestamps) - 1, split_position))
+    split_timestamp = unique_timestamps[split_position]
+
+    train_df = ordered_df[ordered_df.index < split_timestamp].copy()
+    test_df = ordered_df[ordered_df.index >= split_timestamp].copy()
+    return train_df, test_df
+
+
+def build_model_features(df: pd.DataFrame) -> tuple:
+    """
+    Removes non-feature columns and converts string columns to categorical.
+    """
+    features = df.drop(columns=['item_name', 'spot_price'], errors='ignore').copy()
+    categorical_columns = features.select_dtypes(include=['object']).columns.tolist()
+
+    for column in categorical_columns:
+        features[column] = features[column].astype(str).astype('category')
+
+    return features, categorical_columns
 
 def compute_targets(df: pd.DataFrame, horizons: list) -> dict:
     """
@@ -178,31 +274,24 @@ def compute_targets(df: pd.DataFrame, horizons: list) -> dict:
     return y_dict
 
 
-def prepare_pipeline(file_path: str, horizons: list, metadata_df: pd.DataFrame = None) -> tuple:
+def prepare_feature_frame(file_path: str, metadata_df: pd.DataFrame = None) -> pd.DataFrame:
     """
     Executes the full data preparation pipeline for one JSON dataset.
 
-    This function is called once for the training data and once for the
-    test data, providing a clean, DRY (Don't Repeat Yourself) interface
-    to the multi-step preprocessing sequence.
+    The returned frame is later split chronologically into train and test
+    partitions so the holdout period remains a true future-facing evaluation.
 
     Steps executed:
-    1. Load raw JSON and flatten to tabular format (ingestion.py)
+    1. Load the item-level JSON and flatten it to tabular format
     2. Resample to daily frequency and fill short gaps (ingestion.py)
     3. Compute all technical indicator features (features.py)
     4. Simulate and merge external macro factors (features.py)
     5. Join static API metadata (features.py)
-    6. Compute target returns for all horizons (this file)
 
     Parameters
     ----------
     file_path : str
         Path to the input JSON file.
-        Training: 'data/model_training_skin.json'
-        Test:     'data/model_test_skin.json'
-
-    horizons : list of int
-        Forecast horizons. Targets are computed for each.
 
     metadata_df : pd.DataFrame, optional
         Static metadata from the CSGO API (rarity, float caps, etc.).
@@ -210,13 +299,8 @@ def prepare_pipeline(file_path: str, horizons: list, metadata_df: pd.DataFrame =
 
     Returns
     -------
-    tuple of (X, y_dict, df)
-        X       : pd.DataFrame — full feature matrix including 'item_name'
-                  and 'spot_price' columns. Callers should drop these before
-                  passing to model training/inference.
-        y_dict  : dict — maps horizon → target return Series.
-        df      : pd.DataFrame — the full feature-engineered DataFrame
-                  (used by visualization functions that need 'item_name').
+    pd.DataFrame
+        Full feature-engineered DataFrame, ready for temporal splitting.
 
     Notes on External Factor Simulation
     ------------------------------------
@@ -230,12 +314,11 @@ def prepare_pipeline(file_path: str, horizons: list, metadata_df: pd.DataFrame =
 
     For production, replace these two lines with real API data fetches.
     """
-    print(f"Loading {file_path}...")
-    df = load_and_flatten_json(file_path)    # Step 1: parse nested JSON
-    df = clean_and_resample(df)              # Step 2: daily resampling + gap fill
+    df = load_training_json(file_path)
+    df = clean_and_resample(df)
 
     print("Building features...")
-    df = build_internal_features(df)         # Step 3: technical indicators
+    df = build_internal_features(df)
 
     # Step 4: Create external factor DataFrames aligned to the data's timestamps
     timestamps = df.index.unique()
@@ -260,15 +343,7 @@ def prepare_pipeline(file_path: str, horizons: list, metadata_df: pd.DataFrame =
         print("Joining API metadata...")
         df = join_static_metadata(df, metadata_df)
 
-    # Step 6: Compute percentage return targets for each horizon
-    y_dict = compute_targets(df, horizons)
-
-    # Remove non-feature columns from X; keep them in df for visualization
-    drop_cols = ['category', 'marketplace_provider']
-    X = df.drop(columns=drop_cols, errors='ignore')
-    # 'errors=ignore' means missing columns don't raise exceptions
-
-    return X, y_dict, df
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -303,15 +378,23 @@ def main():
     horizons = [8]
 
     # -----------------------------------------------------------------------
-    # STAGE 3: Prepare Training Data
+    # STAGE 3: Prepare Feature Frame and Split Chronologically
     # -----------------------------------------------------------------------
-    # This runs the full ingestion → feature engineering pipeline on the
-    # training JSON file. X_train contains the feature matrix; y_train_dict
-    # contains the target returns; df_train contains the full DataFrame
-    # (used later for visualization with item metadata).
-    X_train, y_train_dict, df_train = prepare_pipeline(
-        'data/model_training_skin.json', horizons, metadata_df=metadata_df
+    # The JSON file now contains the full timeline in one file, so we build the
+    # feature frame once and then create an 80/20 time-based holdout split.
+    feature_frame = prepare_feature_frame(
+        'data/model_training.json', metadata_df=metadata_df
     )
+    train_frame, test_frame = temporal_train_test_split(feature_frame, train_ratio=0.8)
+    print(
+        f"  Temporal split: {len(train_frame):,} training rows / {len(test_frame):,} test rows"
+    )
+
+    y_train_dict = compute_targets(train_frame, horizons)
+    y_test_dict = compute_targets(test_frame, horizons)
+
+    X_train = train_frame.copy()
+    X_test = test_frame.copy()
 
     # -----------------------------------------------------------------------
     # STAGE 4: Hyperparameter Optimization
@@ -325,15 +408,7 @@ def main():
     # Separate the item identifier and price columns from features
     # (the model should not see 'item_name' or 'spot_price' as input features)
     groups = X_train['item_name']
-    # Drop non-feature columns: item_name, spot_price, and string metadata cols
-    # String metadata (collection, weapon_name) are kept for LightGBM categorical
-    # handling in training.py but must be converted to category dtype here too
-    X_train_features = X_train.drop(columns=['item_name', 'spot_price'], errors='ignore')
-
-    # Convert string columns to category dtype for LightGBM compatibility
-    cat_cols = X_train_features.select_dtypes(include=['object']).columns.tolist()
-    for col in cat_cols:
-        X_train_features[col] = X_train_features[col].astype('category')
+    X_train_features, cat_cols = build_model_features(X_train)
 
     best_params = optimizer.optimize(X_train_features, y_train_dict[8], groups=groups)
 
@@ -365,15 +440,11 @@ def main():
     # -----------------------------------------------------------------------
     # STAGE 7: Prepare Test Data
     # -----------------------------------------------------------------------
-    # Run the same ingestion + feature engineering pipeline on the test set.
-    # The test set is temporally distinct from the training set — no overlap.
+    # The test partition uses the same feature pipeline but a later time slice.
     print("\n--- Processing Test Set ---")
-    X_test, y_test_dict, df_test = prepare_pipeline(
-        'data/model_test_skin.json', horizons, metadata_df=metadata_df
-    )
-    X_test_features = X_test.drop(columns=['item_name', 'spot_price'], errors='ignore')
+    X_test_features, _ = build_model_features(X_test)
 
-    # Convert string columns to category dtype (must match training schema)
+    # Align categorical dtypes to the training schema.
     for col in cat_cols:
         if col in X_test_features.columns:
             X_test_features[col] = X_test_features[col].astype('category')
@@ -484,7 +555,7 @@ def main():
     item_mask = items_valid == sample_item
 
     # Get actual price history for the sampled item from the test set
-    sample_actual = df_test[df_test['item_name'] == sample_item][['spot_price']]
+    sample_actual = test_frame[test_frame['item_name'] == sample_item][['spot_price']]
 
     # Get the model's predictions for the sampled item
     sample_pred_full = predictions[item_mask].copy()
@@ -512,7 +583,7 @@ def main():
     )
 
     # Chart 3: Price and volatility regime visualization for the sample item
-    sample_vol = df_test[df_test['item_name'] == sample_item][['spot_price', 'volatility_14']]
+    sample_vol = test_frame[test_frame['item_name'] == sample_item][['spot_price', 'volatility_14']]
     plot_volatility_regimes(
         sample_vol,
         output_path='output/volatility_regimes.html'

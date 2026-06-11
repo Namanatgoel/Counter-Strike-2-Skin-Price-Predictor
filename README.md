@@ -77,8 +77,7 @@ cs2_prediction/
 │   └── validation.py              ← Backtesting with TimeSeriesSplit cross-validation
 │
 ├── data/                          ← Input JSON data files (you provide these)
-│   ├── model_training_skin.json   ← 31+ days of historical price data (training)
-│   └── model_test_skin.json       ← Recent price data for model evaluation (test)
+│   └── model_training.json        ← Combined item-level history used for the full pipeline
 │
 └── output/                        ← Generated charts (created automatically)
     ├── forecast_intervals.html    ← Price forecast with confidence band
@@ -90,7 +89,7 @@ cs2_prediction/
 
 | File | Responsibility | Key Functions |
 |------|---------------|---------------|
-| `ingestion.py` | Reads and cleans raw data | `load_and_flatten_json`, `clean_and_resample` |
+| `ingestion.py` | Reads and cleans raw data | `clean_and_resample` |
 | `features.py` | Computes technical indicators | `build_internal_features`, `merge_external_factors` |
 | `training.py` | Trains all three ML models | `MultiHorizonTrainer.train_models` |
 | `inference.py` | Generates probabilistic forecasts | `QuantileInferenceEngine.predict_with_confidence` |
@@ -373,9 +372,8 @@ If you see an error like `ModuleNotFoundError: No module named 'lightgbm'`, re-r
 
 1. Your terminal must be in the project root directory (the folder containing `main.py`)
 2. Your conda environment must be activated (`(cs2_predictor)` visible in prompt)
-3. Both data files must be present in the `data/` folder:
-   - `data/model_training_skin.json`
-   - `data/model_test_skin.json`
+3. The combined data file must be present in the `data/` folder:
+  - `data/model_training.json`
 
 ### The Only Command You Need
 
@@ -388,8 +386,9 @@ python main.py
 That's it. The entire pipeline runs automatically. You will see progress printed to the terminal:
 
 ```
-Loading data/model_training_skin.json...
+Loading data/model_training.json...
 Building features...
+  Temporal split: 48 training rows / 12 test rows
 
 --- Hyperparameter Optimization (8-Day Horizon) ---
 Best Hyperparameters Found:
@@ -401,8 +400,6 @@ Best Hyperparameters Found:
 --- Training Multi-Algorithm Models ---
 
 --- Processing Test Set ---
-Loading data/model_test_skin.json...
-Building features...
 
 --- Evaluation (8-Day Horizon) ---
   Test RMSE:               $0.0142
@@ -542,13 +539,17 @@ df = pd.read_excel('output/predictions.xlsx')  # or pd.read_csv('output/predicti
 
 Here is every step the code executes, in order, with the exact function responsible:
 
-### Step 1 — JSON Loading (`ingestion.py: load_and_flatten_json`)
+### Step 1 — JSON Loading (`main.py: load_training_json`)
 
-The input data is a nested JSON file with this structure:
+The input data is now a single item-level JSON file with this structure:
 ```json
 {
-  "knife": {
-    "Karambit | Fade (Factory New)": {
+  "Karambit | Fade (Factory New)": {
+    "cat": "knife",
+    "variant": "Factory New",
+    "base": "Karambit | Fade",
+    "rkey": 0,
+    "providers": {
       "steam": {
         "1716998400": 1250.00,
         "1717084800": 1255.50
@@ -563,10 +564,10 @@ The input data is a nested JSON file with this structure:
 
 The function:
 1. Reads the entire file using `ujson` (3–5× faster than Python's built-in `json`)
-2. Splits the top-level categories across multiple CPU cores using `multiprocessing.Pool`
-3. Each CPU core converts its assigned category into a flat list of records
-4. All records are combined into one pandas DataFrame
-5. DataFrame is indexed by timestamp and sorted chronologically
+2. Flattens each item's provider time series into a single row-per-price record
+3. Preserves item metadata like `cat`, `variant`, `base`, and `rkey`
+4. Combines all records into one pandas DataFrame
+5. Indexes the DataFrame by timestamp and sorts chronologically
 
 **Output**: A DataFrame with columns: `timestamp` (index), `category`, `item_name`, `marketplace_provider`, `spot_price`
 
@@ -619,9 +620,11 @@ Currently simulated with random numbers — replace with real API data in produc
 
 ---
 
-### Step 5 — Target Computation (`main.py: compute_targets`)
+### Step 5 — Temporal Split + Target Computation (`main.py: temporal_train_test_split`, `compute_targets`)
 
-Computes the prediction target for each horizon:
+The full feature frame is split chronologically into an 80/20 train/test holdout before targets are computed.
+
+Computes the prediction target for each horizon inside each split:
 
 ```
 target_return = price(t + horizon) / price(t) - 1
@@ -666,7 +669,7 @@ Trains three LightGBM models with quantile objectives:
 
 ### Step 9 — Test Set Evaluation
 
-1. Runs Steps 1–5 on the test JSON file
+1. Runs Steps 1–5 on the held-out test slice from the 80/20 split
 2. Generates P5/P50/P95 predictions for all test observations
 3. Computes RMSE, MAPE, and Directional Accuracy
 
@@ -724,14 +727,13 @@ Then try again.
 
 ---
 
-### "FileNotFoundError: data/model_training_skin.json"
+### "FileNotFoundError: data/model_training.json"
 
 **Cause**: The data files are missing from the `data/` folder.
 
-**Fix**: Make sure both JSON files are in the `data/` directory inside the project folder. The expected paths are:
+**Fix**: Make sure the combined JSON file is in the `data/` directory inside the project folder. The expected path is:
 ```
-cs2_prediction/data/model_training_skin.json
-cs2_prediction/data/model_test_skin.json
+cs2_prediction/data/model_training.json
 ```
 
 ---
@@ -748,7 +750,7 @@ cs2_prediction/data/model_test_skin.json
 
 **Cause**: The full training JSON (~110MB) may require 4–6 GB of RAM to process.
 
-**Fix**: Close other applications to free RAM, or use the smaller `model_test_skin.json` for both training and testing while developing.
+**Fix**: Close other applications to free RAM, or use a smaller subset of `model_training.json` while developing.
 
 ---
 
@@ -824,28 +826,29 @@ Your JSON file must follow this exact structure:
 ```
 Then in `main.py`, change the file paths:
 ```python
-X_train, y_train_dict, df_train = prepare_pipeline('data/YOUR_TRAINING_FILE.json', horizons)
-X_test, y_test_dict, df_test = prepare_pipeline('data/YOUR_TEST_FILE.json', horizons)
+feature_frame = prepare_feature_frame('data/model_training.json', metadata_df=metadata_df)
+train_frame, test_frame = temporal_train_test_split(feature_frame, train_ratio=0.8)
+y_train_dict = compute_targets(train_frame, horizons)
+y_test_dict = compute_targets(test_frame, horizons)
 ```
 
 ### Adding Your Own Data — Detailed Guide
 
 Where to place files
-- Put your datasets in the `data/` folder at the project root. The pipeline expects two files by default:
-  - `data/model_training_skin.json` — historical data used for training
-  - `data/model_test_skin.json`     — held-out recent data used for evaluation and inference
+- Put your dataset in the `data/` folder at the project root:
+  - `data/model_training.json` — combined historical item-level data used for training and evaluation
 
 File format and timestamps
-- Files must match the JSON nesting shown above. Keys for timestamps must be UNIX seconds as strings (e.g. "1716998400").
-- Each timestamp represents a daily price for that item on that `marketplace_name`.
+- Files must match the item-level JSON nesting shown above. Keys for timestamps must be UNIX seconds as strings (e.g. "1716998400").
+- Each timestamp represents a daily price for that item on that `marketplace_provider`.
 - The ingestion step resamples to one row per calendar day (keeps the last price for a day) and forward-fills up to 3 missing days. For best results provide daily or near-daily snapshots.
 
 How predictions map to your data
 - The model predicts a horizon `h` days ahead (default `h = 8`). For a row with `current_date = t`, the prediction refers to `predicted_date = t + h`.
-- The pipeline only evaluates predictions where the true observed price at `t + h` exists in your test dataset. In other words, if your last timestamp in `data/model_test_skin.json` is `D_last`, the latest `current_date` that can be evaluated is `D_last - h`.
+- The pipeline only evaluates predictions where the true observed price at `t + h` exists in the held-out test slice. In other words, if the last timestamp in the test partition is `D_last`, the latest `current_date` that can be evaluated is `D_last - h`.
 
 How many prediction days you will get
-- Let `T` be the number of calendar days present in your test dataset (after resampling). Let `W` be the warm-up days required for feature computation (this project uses `W = 20` for 20-day Bollinger Bands). Then the number of usable rows per item for a forecast horizon `h` is approximately:
+- Let `T` be the number of calendar days present in the full dataset (after resampling). Let `W` be the warm-up days required for feature computation (this project uses `W = 20` for 20-day Bollinger Bands). Then the number of usable rows per item for a forecast horizon `h` is approximately:
 
   usable_rows = T - W - h
 
@@ -853,8 +856,8 @@ Examples:
 - If you provide 31 days of history (T=31), with W=20 and h=8 → usable_rows = 3 (this repo's default example)
 - To have 30 usable rows for h=8, you need T = 30 + 20 + 8 = 58 days of data
 
-If you want predictions for future dates beyond what exists in your test file
-- Option 1 (recommended): Extend `data/model_test_skin.json` with real prices up to the date you want evaluated. The pipeline will then produce evaluated predictions up to `D_last - h`.
+If you want predictions for future dates beyond what exists in your dataset
+- Option 1 (recommended): Extend `data/model_training.json` with real prices up to the date you want evaluated. The pipeline will then produce a later holdout slice with enough future labels for evaluation.
 - Option 2 (forecast without true labels): If you only want point forecasts (no evaluation) for the most recent `current_date`s even though `t + h` is not present, you can run inference on all rows and accept that `true_price` will be NaN and metrics cannot be computed for those rows. To do this, edit `main.py` and replace the valid-mask at the evaluation step:
 
 ```python
@@ -878,7 +881,7 @@ and replace with any list of integers, e.g. `horizons = [1, 3, 8]`.
 - Important: Increasing `h` requires more historical days (see usable_rows formula). If you set `h` greater than your available data permits, the computed targets will be mostly NaN and training/evaluation will fail or produce no usable rows.
 
 Practical tips
-- Start small: if you only have a subset of data, run the pipeline on `model_test_skin.json` alone to sanity-check ingestion and feature engineering.
+- Start small: if you only have a subset of data, run the pipeline on `model_training.json` alone to sanity-check ingestion and feature engineering.
 - Use longer history (60–120 days) when you want multi-horizon forecasts (1, 3, 8, 16 days). More history improves feature warm-up and stability.
 - Keep timestamps in UTC and use end-of-day or daily snapshots for consistency.
 - If you only want deployment-style forecasts (no evaluation), consider creating a thin `data/deploy.json` that contains the latest prices and run a small wrapper that loads the trained models and produces predictions without computing metrics (I can help scaffold this if you want).
