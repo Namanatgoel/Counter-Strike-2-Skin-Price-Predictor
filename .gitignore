@@ -8,4 +8,5 @@ __pycache__/
 *.zip
 data/
 !data/sample_empty.json
-
+.gitignore
+.gitignore.save
