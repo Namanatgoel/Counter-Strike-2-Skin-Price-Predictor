@@ -102,7 +102,7 @@ import ujson
 from src.ingestion import clean_and_resample
 from src.features import build_internal_features, merge_external_factors, join_static_metadata
 from src.metadata import fetch_api_skins, extract_api_features
-from src.training import MultiHorizonTrainer
+from src.training import MultiHorizonTrainer, optimize_memory_usage
 from src.inference import QuantileInferenceEngine
 from src.tuning import HyperparameterOptimizer
 from src.visualization import plot_forecast_intervals, plot_shap_summary, plot_volatility_regimes
@@ -149,7 +149,7 @@ def load_training_json(file_path: str) -> pd.DataFrame:
                         'category': category,
                         'item_name': item_name,
                         'marketplace_provider': provider,
-                        'spot_price': float(price),
+                        'spot_price': np.float32(price),
                     }
                     record.update(item_metadata)
                     records.append(record)
@@ -163,7 +163,7 @@ def load_training_json(file_path: str) -> pd.DataFrame:
                             'category': category_name,
                             'item_name': item_name,
                             'marketplace_provider': provider,
-                            'spot_price': float(price),
+                            'spot_price': np.float32(price),
                         })
 
     df = pd.DataFrame(records)
@@ -203,8 +203,8 @@ def build_model_features(df: pd.DataFrame) -> tuple:
     """
     Removes non-feature columns and converts string columns to categorical.
     """
-    features = df.drop(columns=['item_name', 'spot_price'], errors='ignore').copy()
-    categorical_columns = features.select_dtypes(include=['object']).columns.tolist()
+    features = df.drop(columns=['item_name', 'spot_price'], errors='ignore')
+    categorical_columns = features.select_dtypes(include=['object', 'category']).columns.tolist()
 
     for column in categorical_columns:
         features[column] = features[column].astype(str).astype('category')
@@ -269,7 +269,7 @@ def compute_targets(df: pd.DataFrame, horizons: list) -> dict:
         )['spot_price'].shift(-h)
 
         # Compute percentage return: how much does the price change?
-        y_dict[h] = target_price / df['spot_price'] - 1
+        y_dict[h] = (target_price / df['spot_price'] - 1).astype('float32')
 
     return y_dict
 
@@ -343,6 +343,8 @@ def prepare_feature_frame(file_path: str, metadata_df: pd.DataFrame = None) -> p
         print("Joining API metadata...")
         df = join_static_metadata(df, metadata_df)
 
+    optimize_memory_usage(df)
+
     return df
 
 
@@ -393,8 +395,8 @@ def main():
     y_train_dict = compute_targets(train_frame, horizons)
     y_test_dict = compute_targets(test_frame, horizons)
 
-    X_train = train_frame.copy()
-    X_test = test_frame.copy()
+    X_train = train_frame
+    X_test = test_frame
 
     # -----------------------------------------------------------------------
     # STAGE 4: Hyperparameter Optimization
@@ -409,6 +411,7 @@ def main():
     # (the model should not see 'item_name' or 'spot_price' as input features)
     groups = X_train['item_name']
     X_train_features, cat_cols = build_model_features(X_train)
+    optimize_memory_usage(X_train_features)
 
     best_params = optimizer.optimize(X_train_features, y_train_dict[8], groups=groups)
 
@@ -443,6 +446,7 @@ def main():
     # The test partition uses the same feature pipeline but a later time slice.
     print("\n--- Processing Test Set ---")
     X_test_features, _ = build_model_features(X_test)
+    optimize_memory_usage(X_test_features)
 
     # Align categorical dtypes to the training schema.
     for col in cat_cols:

@@ -11,7 +11,7 @@ single model that predicts all horizons at once, we use a strategy called
 **Direct Multi-Step Forecasting**, which avoids error accumulation that
 plagues recursive (iterated one-step) approaches.
 
-Three algorithms are trained in parallel for later comparison:
+Three algorithms are trained sequentially for later comparison:
 
 1. **HistGradientBoostingRegressor** (scikit-learn)
    - A histogram-based GBM that bins continuous features before splitting.
@@ -22,7 +22,7 @@ Three algorithms are trained in parallel for later comparison:
 2. **XGBoost** (xgboost library)
    - "eXtreme Gradient Boosting" — industry standard for tabular ML.
    - Regularization terms (L1/L2) reduce overfitting on noisy financial data.
-   - `n_jobs=-1` enables multi-threaded tree building.
+    - `n_jobs=2` keeps thread-pool memory use bounded.
    - `objective='reg:squarederror'` optimizes the squared-error loss
      function, appropriate for continuous price return prediction.
 
@@ -79,12 +79,43 @@ Dependencies
     lightgbm     — LGBMRegressor
 """
 
+import gc
+
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from sklearn.inspection import permutation_importance
+
+
+MAX_WORKERS = 2
+
+
+def optimize_memory_usage(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric columns and convert object columns to category."""
+    float_cols = df.select_dtypes(include=['float64']).columns
+    for column in float_cols:
+        df[column] = df[column].astype('float32')
+
+    int_cols = df.select_dtypes(include=['int64']).columns
+    for column in int_cols:
+        df[column] = df[column].astype('int32')
+
+    object_cols = df.select_dtypes(include=['object']).columns
+    for column in object_cols:
+        df[column] = df[column].astype('category')
+
+    return df
+
+
+def _normalize_categorical_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Force categorical inputs to use a uniform string-backed category dtype."""
+    categorical_cols = df.select_dtypes(include=['object', 'category']).columns
+    for column in categorical_cols:
+        df[column] = df[column].astype(str).astype('category')
+
+    return df
 
 
 class MultiHorizonTrainer:
@@ -147,7 +178,7 @@ class MultiHorizonTrainer:
 
         All models use `random_state=42` for reproducibility — given the
         same data and this seed, every run produces identical results.
-        `n_jobs=-1` tells XGBoost and LightGBM to use all available CPU cores.
+        `n_jobs=2` keeps the training process from over-subscribing RAM.
 
         Parameters
         ----------
@@ -176,23 +207,26 @@ class MultiHorizonTrainer:
         elif algo_name == 'xgboost':
             # XGBRegressor:
             # - 'reg:squarederror' = minimize (prediction - actual)²
-            # - n_jobs=-1 = use all CPU cores for parallel tree building
+            # - tree_method='hist' = lower-memory histogram builder
+            # - n_jobs=2 = keep worker count small
             # - random_state=42 = deterministic results
             return XGBRegressor(
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=MAX_WORKERS,
                 objective='reg:squarederror',
-                enable_categorical=True
+                tree_method='hist',
+                enable_categorical=True,
+                max_bin=256
             )
 
         elif algo_name == 'lightgbm':
             # LGBMRegressor:
             # - Leaf-wise tree growth = faster convergence than level-wise
             # - verbose=-1 = suppress iteration log spam
-            # - n_jobs=-1 = all CPU cores
+            # - n_jobs=2 = all CPU cores is unnecessary for this workload
             return LGBMRegressor(
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=MAX_WORKERS,
                 verbose=-1
             )
 
@@ -254,51 +288,49 @@ class MultiHorizonTrainer:
 
                 # Remove rows where the future price is unknown (end of dataset)
                 valid_idx = y_target.notna()
-                X_train = X[valid_idx]
-                y_train = y_target[valid_idx]
+                X_train = _normalize_categorical_columns(X.loc[valid_idx].copy())
+                y_train = y_target.loc[valid_idx].astype('float32', copy=False)
 
-                # Instantiate a fresh, unfitted model
-                model = self._get_base_estimator(algo)
+                model = None
+                result = None
+                imp_df = None
 
-                # HistGradientBoosting cannot handle very high-cardinality
-                # categorical dtypes, so we feed it integer codes instead.
-                # XGBoost and LightGBM keep the categorical dtype.
-                X_model = X_train.copy()
+                try:
+                    # Fit: this is where actual learning happens.
+                    # The input frame is already optimized and categorical
+                    # columns are preserved as pandas category dtype.
+                    model = self._get_base_estimator(algo)
+                    model.fit(X_train, y_train)
 
-                # Convert string columns to pandas category dtype so that
-                # LightGBM can use native categorical splits (more efficient
-                # and accurate than one-hot encoding for high-cardinality features)
-                cat_cols = X_train.select_dtypes(include=['object', 'category']).columns.tolist()
-                if algo == 'hist_gb':
-                    for col in cat_cols:
-                        X_model[col] = pd.Categorical(X_model[col].astype(str)).codes.astype('int32')
-                else:
-                    for col in cat_cols:
-                        X_model[col] = X_model[col].astype(str).astype('category')
+                    # Store the fitted model for later inference.
+                    self.models[algo][h] = model
 
-                # Fit: this is where actual learning happens
-                model.fit(X_model, y_train)
+                    # Keep permutation importance bounded on very large frames.
+                    importance_max_samples = 100_000 if len(X_train) > 100_000 else 1.0
+                    result = permutation_importance(
+                        model,
+                        X_train,
+                        y_train,
+                        n_repeats=5,
+                        random_state=42,
+                        n_jobs=1,
+                        max_samples=importance_max_samples
+                    )
 
-                # Store the fitted model for later inference
-                self.models[algo][h] = model
+                    # Build a readable DataFrame sorted by importance descending.
+                    imp_df = pd.DataFrame({
+                        'feature': X_train.columns,
+                        'importance': result.importances_mean
+                    }).sort_values(by='importance', ascending=False)
 
-                # --- Permutation Feature Importance ---
-                # n_repeats=5: each feature is shuffled 5 times, results averaged
-                # n_jobs=-1: parallelized across CPU cores
-                result = permutation_importance(
-                    model, X_model, y_train,
-                    n_repeats=5,
-                    random_state=42,
-                    n_jobs=-1
-                )
-
-                # Build a readable DataFrame sorted by importance descending
-                imp_df = pd.DataFrame({
-                    'feature': X_model.columns,
-                    'importance': result.importances_mean  # average over 5 shuffles
-                }).sort_values(by='importance', ascending=False)
-
-                self.feature_importance[algo][h] = imp_df
+                    self.feature_importance[algo][h] = imp_df
+                finally:
+                    del result
+                    del imp_df
+                    del model
+                    del X_train
+                    del y_train
+                    gc.collect()
 
     def get_importance(self, algo_name: str, horizon: int) -> pd.DataFrame:
         """
