@@ -16,3 +16,4 @@ output/predictions.csv
 output/predictions.xlsx
 
 output/shap_summary.html
+output/predictions.xlsx
