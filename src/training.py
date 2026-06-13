@@ -90,6 +90,7 @@ from sklearn.inspection import permutation_importance
 
 
 MAX_WORKERS = 2
+MAX_HISTGB_CATEGORIES = 255
 
 
 def optimize_memory_usage(df: pd.DataFrame) -> pd.DataFrame:
@@ -115,6 +116,18 @@ def _normalize_categorical_columns(df: pd.DataFrame) -> pd.DataFrame:
     for column in categorical_cols:
         df[column] = df[column].astype(str).astype('category')
 
+    return df
+
+
+def _drop_high_cardinality_categoricals(df: pd.DataFrame, max_categories: int = MAX_HISTGB_CATEGORIES) -> pd.DataFrame:
+    """Drop categorical columns that exceed HistGradientBoosting's category limit."""
+    categorical_cols = df.select_dtypes(include=['category']).columns
+    columns_to_drop = [
+        column for column in categorical_cols
+        if df[column].nunique(dropna=True) > max_categories
+    ]
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
     return df
 
 
@@ -289,6 +302,8 @@ class MultiHorizonTrainer:
                 # Remove rows where the future price is unknown (end of dataset)
                 valid_idx = y_target.notna()
                 X_train = _normalize_categorical_columns(X.loc[valid_idx].copy())
+                if algo == 'hist_gb':
+                    X_train = _drop_high_cardinality_categoricals(X_train)
                 y_train = y_target.loc[valid_idx].astype('float32', copy=False)
 
                 model = None

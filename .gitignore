@@ -10,3 +10,9 @@ data/
 !data/sample_empty.json
 .gitignore
 .gitignore.save
+*.csv
+*.xlsx
+output/predictions.csv
+output/predictions.xlsx
+
+output/shap_summary.html

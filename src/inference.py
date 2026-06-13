@@ -75,6 +75,21 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 
 
+MAX_HISTGB_CATEGORIES = 255
+
+
+def _drop_high_cardinality_categoricals(df: pd.DataFrame, max_categories: int = MAX_HISTGB_CATEGORIES) -> tuple[pd.DataFrame, list[str]]:
+    """Drop categorical columns that exceed HistGradientBoosting's category limit."""
+    categorical_cols = df.select_dtypes(include=['category']).columns
+    columns_to_drop = [
+        column for column in categorical_cols
+        if df[column].nunique(dropna=True) > max_categories
+    ]
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+    return df, columns_to_drop
+
+
 class QuantileInferenceEngine:
     """
     Trains three quantile regression models (P5, P50, P95) for a given
@@ -121,6 +136,7 @@ class QuantileInferenceEngine:
         self.algo_name = algo_name
         self.quantiles = [0.05, 0.50, 0.95]  # P5, median, P95
         self.models = {}                       # filled by fit_horizon()
+        self._histgb_dropped_columns = {}
 
     def _get_quantile_estimator(self, alpha: float):
         """
@@ -209,6 +225,12 @@ class QuantileInferenceEngine:
         X_train = X[valid_idx]
         y_train = y_target[valid_idx]
 
+        if self.algo_name == 'hist_gb':
+            X_train, dropped_columns = _drop_high_cardinality_categoricals(X_train.copy())
+            self._histgb_dropped_columns[horizon] = dropped_columns
+        else:
+            self._histgb_dropped_columns[horizon] = []
+
         self.models[horizon] = {}  # initialize storage for this horizon
 
         # Train one model per quantile
@@ -277,6 +299,11 @@ class QuantileInferenceEngine:
                 f"No model trained for horizon={horizon}. "
                 f"Call fit_horizon() first."
             )
+
+        if self.algo_name == 'hist_gb':
+            dropped_columns = self._histgb_dropped_columns.get(horizon, [])
+            if dropped_columns:
+                X_infer = X_infer.drop(columns=[col for col in dropped_columns if col in X_infer.columns])
 
         # --- Step 1: Predict percentage returns for each quantile ---
         # Each model's predict() returns a numpy array of return values
