@@ -80,6 +80,7 @@ cs2_prediction/
 │   └── model_training.json        ← Combined item-level history used for the full pipeline
 │
 └── output/                        ← Generated charts (created automatically)
+    └── model_store/               ← Cached trained model bundle and metadata
     ├── forecast_intervals.html    ← Price forecast with confidence band
     ├── shap_summary.html          ← Feature importance visualization
     └── volatility_regimes.html    ← Price + volatility overlay chart
@@ -94,7 +95,126 @@ cs2_prediction/
 | `training.py` | Trains all three ML models | `MultiHorizonTrainer.train_models` |
 | `inference.py` | Generates probabilistic forecasts | `QuantileInferenceEngine.predict_with_confidence` |
 | `tuning.py` | Optimizes model hyperparameters | `HyperparameterOptimizer.optimize` |
+| `model_registry.py` | Saves and reloads trained bundles | `save_model_bundle`, `load_model_bundle` |
 | `validation.py` | Backtests model accuracy | `backtest_pipeline` |
+
+### Model Caching and Retraining
+
+The pipeline caches the trained bundle in `output/model_store/`.
+
+- If the historical source data has not changed and the cache is still fresh, the pipeline reloads the saved bundle and skips retraining.
+- If newer data arrives or the cache is stale, the pipeline retrains from the historical dataset.
+- The old bundle is replaced only when the new model performs better on the current holdout set.
+
+This keeps the first full training run intact while making later runs much faster.
+
+### How Staleness Is Decided (Exact Method)
+
+The staleness check is implemented in `src/model_registry.py` (`bundle_is_current`) and used in `main.py` before the expensive training stages.
+
+The cache is considered **current** only if all of the following are true:
+
+1. A saved bundle exists on disk.
+2. The saved `source_fingerprint` exactly matches the current `source_fingerprint`.
+3. The saved `trained_at` timestamp exists and can be parsed.
+4. The model age is strictly less than `retrain_interval_days` (currently 7 days).
+
+If any condition fails, the cache is treated as stale and retraining starts.
+
+#### Source Fingerprint Construction
+
+The source fingerprint is built from:
+
+- SHA-256 hash of `data/model_training.json`
+- DataFrame fingerprint of API metadata (values + index + columns + dtypes)
+- Forecast horizon list (for example, `8`)
+- Artifact version constant
+
+All parts are concatenated into one payload and hashed again with SHA-256.
+
+So, even if one source component changes (new data file content, metadata change, horizon change, or artifact version bump), the final fingerprint changes and the cache becomes stale.
+
+#### Time-Based Freshness Formula
+
+Model age is computed as:
+
+$$
+\mathrm{age\_days} = \frac{(\mathrm{now\_utc} - \mathrm{trained\_at\_utc})_{\mathrm{seconds}}}{86400}
+$$
+
+Freshness condition:
+
+$$
+\mathrm{age\_days} < \mathrm{retrain\_interval\_days}
+$$
+
+Current code value:
+
+$$
+\mathrm{retrain\_interval\_days} = 7
+$$
+
+### How New vs Old Model Is Decided (Exact Method)
+
+After retraining, both models are evaluated on the holdout pipeline and compared by `src/model_registry.py` (`is_better_holdout`).
+
+Current replacement rule is **RMSE-only**:
+
+$$
+RMSE_{new} < RMSE_{old}
+$$
+
+If the new RMSE is not lower, the old bundle is kept.
+
+#### Holdout Metrics Computed
+
+In `main.py` (`evaluate_predictions`), the pipeline computes:
+
+1. MAPE (percentage error)
+2. RMSE (absolute error in price units)
+3. Directional accuracy
+
+The comparison function currently uses only `rmse` for the replace/keep decision. MAPE and directional accuracy are stored and printed but not used as tie-breakers.
+
+#### RMSE Formula Used
+
+For true future prices $y_i$ and predicted median prices $\hat{y}_i$:
+
+$$
+RMSE = \sqrt{\frac{1}{n} \sum_{i=1}^{n} (y_i - \hat{y}_i)^2}
+$$
+
+#### MAPE Formula Used
+
+$$
+MAPE = \frac{100}{n} \sum_{i=1}^{n} \left|\frac{y_i - \hat{y}_i}{y_i}\right|
+$$
+
+#### Directional Accuracy Formula Used
+
+Let return direction be computed with `sign(...)` for actual and predicted moves:
+
+$$
+\mathrm{Directional\ Accuracy} = \frac{1}{n} \sum_{i=1}^{n} \mathbf{1}\{\operatorname{sign}(r_i^{actual}) = \operatorname{sign}(r_i^{pred})\} \times 100
+$$
+
+### Decision Flow Summary
+
+1. Build current source fingerprint from data file + metadata + horizons + artifact version.
+2. Load old bundle (if present).
+3. If bundle is current (fingerprint match + age < 7 days), skip retraining.
+4. Otherwise train a candidate model bundle.
+5. Evaluate candidate holdout metrics.
+6. If old bundle exists, compare by RMSE:
+Candidate RMSE lower -> save candidate and replace old bundle.
+Candidate RMSE not lower -> keep old bundle.
+7. If no old bundle exists, save candidate bundle.
+
+### Important Practical Notes
+
+- The placeholder external factors (`liquidity_vol`, `cs2_players`) are generated with a fixed RNG seed (`np.random.default_rng(42)`), which helps keep runs reproducible while using synthetic data.
+- Because replacement is RMSE-only, a model with slightly worse MAPE but better RMSE will still replace the old one.
+- If you want multi-objective replacement (for example, RMSE primary, MAPE secondary, directional accuracy tertiary), you can extend `is_better_holdout` accordingly.
 
 ---
 

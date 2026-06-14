@@ -8,11 +8,17 @@ every stage in the correct order:
 
     1. Data Ingestion     → Load and flatten JSON price data
     2. Feature Engineering → Compute technical indicators
-    3. External Factors   → Merge market liquidity and player count data
-    4. Hyperparameter Tuning → Bayesian search for optimal LightGBM config
-    5. Model Training     → Train all three algorithms for the 8-day horizon
-    6. Quantile Inference → Train probabilistic (P5/P50/P95) models
-    7. Test Set Evaluation → Load test data, predict, compute metrics
+    bundle_needs_retrain = not bundle_is_current(existing_bundle, source_fingerprint, retrain_interval_days=7)
+    candidate_bundle = None
+    X_train_features, cat_cols = build_model_features(X_train)
+    optimize_memory_usage(X_train_features)
+
+    if bundle_needs_retrain:
+        # Run Bayesian optimization to find the best LightGBM configuration.
+        # `groups=X_train['item_name']` passes item names to GroupKFold so
+        # that different rows of the same item always land in the same fold.
+        print("\n--- Hyperparameter Optimization (8-Day Horizon) ---")
+        optimizer = HyperparameterOptimizer(n_trials=20, horizon=8)
     8. Visualization      → Generate 3 interactive HTML charts
 
 Pipeline Architecture
@@ -95,6 +101,7 @@ data requires changing only 3 lines in `prepare_pipeline()`.
 import pandas as pd
 import numpy as np
 import os
+from datetime import datetime, timezone
 import warnings
 import ujson
 
@@ -105,6 +112,13 @@ from src.metadata import fetch_api_skins, extract_api_features
 from src.training import MultiHorizonTrainer, optimize_memory_usage
 from src.inference import QuantileInferenceEngine
 from src.tuning import HyperparameterOptimizer
+from src.model_registry import (
+    build_source_fingerprint,
+    bundle_is_current,
+    is_better_holdout,
+    load_model_bundle,
+    save_model_bundle,
+)
 from src.visualization import plot_forecast_intervals, plot_shap_summary, plot_volatility_regimes
 
 # Suppress deprecation and future warnings from third-party libraries
@@ -125,7 +139,7 @@ def load_training_json(file_path: str) -> pd.DataFrame:
     nested `providers` dictionary containing timestamped prices.
     """
     print(f"Loading {file_path}...")
-    with open(file_path, 'r') as file_handle:
+    with open(file_path, 'r', encoding='utf-8') as file_handle:
         data = ujson.load(file_handle)
 
     records = []
@@ -322,16 +336,17 @@ def prepare_feature_frame(file_path: str, metadata_df: pd.DataFrame = None) -> p
 
     # Step 4: Create external factor DataFrames aligned to the data's timestamps
     timestamps = df.index.unique()
+    rng = np.random.default_rng(42)
 
     # --- PLACEHOLDER: Replace with real liquidity data from marketplace APIs ---
     liquidity_df = pd.DataFrame(
-        {'liquidity_vol': np.random.randint(100, 10000, len(timestamps))},
+        {'liquidity_vol': rng.integers(100, 10000, len(timestamps))},
         index=timestamps
     )
 
     # --- PLACEHOLDER: Replace with real Steam concurrent player count data ---
     player_count_df = pd.DataFrame(
-        {'cs2_players': np.random.randint(800000, 1500000, len(timestamps))},
+        {'cs2_players': rng.integers(800000, 1500000, len(timestamps))},
         index=timestamps
     )
 
@@ -397,48 +412,110 @@ def main():
 
     X_train = train_frame
     X_test = test_frame
+    source_fingerprint = build_source_fingerprint('data/model_training.json', metadata_df, horizons)
+    bundle_path = os.path.join('output', 'model_store', 'cs2_model_bundle.joblib')
+    existing_bundle = load_model_bundle(bundle_path)
+
+    def align_features(features: pd.DataFrame, expected_columns: list[str], categorical_columns: list[str]) -> pd.DataFrame:
+        aligned_features = features.copy()
+
+        for column in expected_columns:
+            if column not in aligned_features.columns:
+                aligned_features[column] = np.nan
+
+        aligned_features = aligned_features.reindex(columns=expected_columns)
+
+        for column in categorical_columns:
+            if column in aligned_features.columns:
+                aligned_features[column] = aligned_features[column].astype('category')
+
+        return aligned_features
+
+    def evaluate_predictions(predictions_df: pd.DataFrame, current_prices: pd.Series, actual_returns: pd.Series) -> dict:
+        true_prices_local = current_prices * (1 + actual_returns)
+        mape_local = np.mean(np.abs((true_prices_local - predictions_df['Prediction_P50']) / true_prices_local)) * 100
+        rmse_local = np.sqrt(np.mean((true_prices_local - predictions_df['Prediction_P50'])**2))
+        actual_direction = np.sign(actual_returns)
+        predicted_direction = np.sign((predictions_df['Prediction_P50'] - current_prices) / current_prices)
+        directional_accuracy = np.mean(actual_direction == predicted_direction) * 100
+
+        return {
+            'mape': float(mape_local),
+            'rmse': float(rmse_local),
+            'directional_accuracy': float(directional_accuracy),
+            'true_prices': true_prices_local,
+        }
+
+    bundle_needs_retrain = not bundle_is_current(existing_bundle, source_fingerprint, retrain_interval_days=7)
+    candidate_bundle = None
 
     # -----------------------------------------------------------------------
     # STAGE 4: Hyperparameter Optimization
     # -----------------------------------------------------------------------
-    # Run Bayesian optimization to find the best LightGBM configuration.
-    # `groups=X_train['item_name']` passes item names to GroupKFold so
-    # that different rows of the same item always land in the same fold.
-    print("\n--- Hyperparameter Optimization (8-Day Horizon) ---")
-    optimizer = HyperparameterOptimizer(n_trials=20, horizon=8)
-
-    # Separate the item identifier and price columns from features
-    # (the model should not see 'item_name' or 'spot_price' as input features)
-    groups = X_train['item_name']
     X_train_features, cat_cols = build_model_features(X_train)
     optimize_memory_usage(X_train_features)
 
-    best_params = optimizer.optimize(X_train_features, y_train_dict[8], groups=groups)
+    if bundle_needs_retrain:
+        # Run Bayesian optimization to find the best LightGBM configuration.
+        # `groups=X_train['item_name']` passes item names to GroupKFold so
+        # that different rows of the same item always land in the same fold.
+        print("\n--- Hyperparameter Optimization (8-Day Horizon) ---")
+        optimizer = HyperparameterOptimizer(n_trials=20, horizon=8)
 
-    print("Best Hyperparameters Found:")
-    for param, value in best_params.items():
-        print(f"  {param}: {value}")
+        # Separate the item identifier and price columns from features
+        # (the model should not see 'item_name' or 'spot_price' as input features)
+        groups = X_train['item_name']
+        best_params = optimizer.optimize(X_train_features, y_train_dict[8], groups=groups)
 
-    # Train the "best model" on full training data with optimal params
-    # (used for SHAP visualization, not for the final inference predictions)
-    best_model = optimizer.get_best_model(X_train_features, y_train_dict[8])
+        print("Best Hyperparameters Found:")
+        for param, value in best_params.items():
+            print(f"  {param}: {value}")
 
-    # -----------------------------------------------------------------------\n    # STAGE 5: Multi-Algorithm Training
-    # -----------------------------------------------------------------------
-    # Train all three algorithms (HistGBM, XGBoost, LightGBM) for the
-    # 8-day horizon using their default hyperparameters.
-    # This populates trainer.models[algo][8] for comparison.
-    print("\n--- Training Multi-Algorithm Models ---")
-    trainer = MultiHorizonTrainer(horizons=horizons)
-    trainer.train_models(X_train_features, y_train_dict)
+        # Train the "best model" on full training data with optimal params
+        # (used for SHAP visualization, not for the final inference predictions)
+        best_model = optimizer.get_best_model(X_train_features, y_train_dict[8])
 
-    # -----------------------------------------------------------------------
-    # STAGE 6: Quantile Inference Training
-    # -----------------------------------------------------------------------
-    # Train the probabilistic (P5/P50/P95) models using LightGBM quantile
-    # regression. This is separate from the point-estimate models above.
-    inference_engine = QuantileInferenceEngine(algo_name='lightgbm')
-    inference_engine.fit_horizon(X_train_features, y_train_dict[8], horizon=8)
+        # -----------------------------------------------------------------------
+        # STAGE 5: Multi-Algorithm Training
+        # -----------------------------------------------------------------------
+        # Train all three algorithms (HistGBM, XGBoost, LightGBM) for the
+        # 8-day horizon using their default hyperparameters.
+        # This populates trainer.models[algo][8] for comparison.
+        print("\n--- Training Multi-Algorithm Models ---")
+        trainer = MultiHorizonTrainer(horizons=horizons)
+        trainer.train_models(X_train_features, y_train_dict)
+
+        # -----------------------------------------------------------------------
+        # STAGE 6: Quantile Inference Training
+        # -----------------------------------------------------------------------
+        # Train the probabilistic (P5/P50/P95) models using LightGBM quantile
+        # regression. This is separate from the point-estimate models above.
+        inference_engine = QuantileInferenceEngine(algo_name='lightgbm')
+        inference_engine.fit_horizon(X_train_features, y_train_dict[8], horizon=8)
+
+        candidate_bundle = {
+            'trained_at': datetime.now(timezone.utc).isoformat(),
+            'source_fingerprint': source_fingerprint,
+            'feature_columns': list(X_train_features.columns),
+            'categorical_columns': cat_cols,
+            'best_params': best_params,
+            'best_model': best_model,
+            'trainer': trainer,
+            'inference_engine': inference_engine,
+        }
+    else:
+        print("\n--- Model Bundle Check ---")
+        print("  Existing model bundle is current; skipping retraining.")
+        best_params = existing_bundle['best_params']
+        best_model = existing_bundle['best_model']
+        trainer = existing_bundle['trainer']
+        inference_engine = existing_bundle['inference_engine']
+        X_train_features = align_features(
+            X_train_features,
+            existing_bundle['feature_columns'],
+            existing_bundle['categorical_columns'],
+        )
+        cat_cols = existing_bundle['categorical_columns']
 
     # -----------------------------------------------------------------------
     # STAGE 7: Prepare Test Data
@@ -448,10 +525,12 @@ def main():
     X_test_features, _ = build_model_features(X_test)
     optimize_memory_usage(X_test_features)
 
-    # Align categorical dtypes to the training schema.
-    for col in cat_cols:
-        if col in X_test_features.columns:
-            X_test_features[col] = X_test_features[col].astype('category')
+    active_bundle = candidate_bundle if candidate_bundle is not None else existing_bundle
+    X_test_features = align_features(
+        X_test_features,
+        active_bundle['feature_columns'],
+        active_bundle['categorical_columns'],
+    )
 
     # -----------------------------------------------------------------------
     # STAGE 7: Inference & Evaluation on Test Data
@@ -463,8 +542,9 @@ def main():
     #   3. Directional Accuracy — did we predict up/down correctly?
     print("\n--- Evaluation (8-Day Horizon) ---")
 
-    # Create validity mask: exclude test rows where the 8-day future is unknown
-    y_target_8d_ret = y_test_dict[8]
+    # Create validity mask: exclude test rows where the horizon future is unknown
+    forecast_horizon = horizons[0]
+    y_target_8d_ret = y_test_dict[forecast_horizon]
     valid_idx = y_target_8d_ret.notna()
 
     # Slice to only valid rows for inference
@@ -474,39 +554,62 @@ def main():
     items_valid    = X_test.loc[valid_idx, 'item_name']    # item names (for selecting sample item)
 
     # Generate predictions: returns P5, P50, P95, and Confidence Score
-    predictions = inference_engine.predict_with_confidence(
-        X_test_valid, prices_valid, horizon=8
+    predictions = active_bundle['inference_engine'].predict_with_confidence(
+        X_test_valid, prices_valid, horizon=forecast_horizon
     )
 
-    # Reconstruct true future prices from the target returns:
-    #   true_price = current_price × (1 + true_return)
-    true_prices = prices_valid * (1 + y_test_valid)
+    evaluation = evaluate_predictions(predictions, prices_valid, y_test_valid)
 
-    # --- Metric 1: MAPE (Mean Absolute Percentage Error) ---
-    # Average of |true - predicted| / true, as a percentage
-    mape = np.mean(
-        np.abs((true_prices - predictions['Prediction_P50']) / true_prices)
-    ) * 100
+    if bundle_needs_retrain and existing_bundle:
+        incumbent_metrics = existing_bundle.get('holdout_metrics', {})
+        if not is_better_holdout(evaluation, incumbent_metrics):
+            active_bundle = existing_bundle
+            X_test_features = align_features(
+                X_test_features,
+                active_bundle['feature_columns'],
+                active_bundle['categorical_columns'],
+            )
+            X_test_valid = X_test_features[valid_idx]
+            predictions = active_bundle['inference_engine'].predict_with_confidence(
+                X_test_valid, prices_valid, horizon=forecast_horizon
+            )
+            evaluation = evaluate_predictions(predictions, prices_valid, y_test_valid)
+            print("  Cached model performed better on the holdout; keeping the old bundle.")
+        else:
+            candidate_bundle['holdout_metrics'] = {
+                'mape': evaluation['mape'],
+                'rmse': evaluation['rmse'],
+                'directional_accuracy': evaluation['directional_accuracy'],
+            }
+            save_model_bundle(candidate_bundle, bundle_path)
+            active_bundle = candidate_bundle
+            print(f"  New model replaced the cached bundle at {bundle_path}")
+    elif bundle_needs_retrain and not existing_bundle:
+        candidate_bundle['holdout_metrics'] = {
+            'mape': evaluation['mape'],
+            'rmse': evaluation['rmse'],
+            'directional_accuracy': evaluation['directional_accuracy'],
+        }
+        save_model_bundle(candidate_bundle, bundle_path)
+        active_bundle = candidate_bundle
+        print(f"  Model bundle saved to {bundle_path}")
+    elif existing_bundle:
+        evaluation = existing_bundle.get('holdout_metrics', evaluation)
 
-    # --- Metric 2: RMSE (Root Mean Squared Error) ---
-    # Square root of average squared errors — penalizes large errors
-    rmse = np.sqrt(
-        np.mean((true_prices - predictions['Prediction_P50'])**2)
+    best_model = active_bundle['best_model']
+    trainer = active_bundle['trainer']
+    inference_engine = active_bundle['inference_engine']
+    X_train_features = align_features(
+        X_train_features,
+        active_bundle['feature_columns'],
+        active_bundle['categorical_columns'],
     )
-
-    # --- Metric 3: Directional Accuracy ---
-    # Did the model correctly predict whether the price would go up or down?
-    # np.sign: +1 for positive, -1 for negative, 0 for zero
-    actual_dir = np.sign(y_test_valid)
-    pred_dir   = np.sign(
-        (predictions['Prediction_P50'] - prices_valid) / prices_valid
-    )
-    dir_acc = np.mean(actual_dir == pred_dir) * 100
+    cat_cols = active_bundle['categorical_columns']
 
     # Display metrics
-    print(f"  Test RMSE:               ${rmse:.4f}")
-    print(f"  Test MAPE:               {mape:.2f}%")
-    print(f"  Directional Accuracy:    {dir_acc:.2f}%")
+    print(f"  Test RMSE:               ${evaluation['rmse']:.4f}")
+    print(f"  Test MAPE:               {evaluation['mape']:.2f}%")
+    print(f"  Directional Accuracy:    {evaluation['directional_accuracy']:.2f}%")
 
     # -----------------------------------------------------------------------
     # OUTPUT: Save predictions to Excel (or CSV fallback)
@@ -520,9 +623,9 @@ def main():
         output_df['item_name'] = items_valid.values
         output_df['current_date'] = output_df.index
         # Predictions are for t + horizon days
-        output_df['predicted_date'] = output_df.index + pd.Timedelta(days=8)
+        output_df['predicted_date'] = output_df.index + pd.Timedelta(days=forecast_horizon)
         output_df['current_price'] = prices_valid.values
-        output_df['true_price'] = true_prices.values
+        output_df['true_price'] = evaluation['true_prices'].values
 
         # Reorder columns for readability
         cols = [
@@ -566,7 +669,7 @@ def main():
 
     # Shift prediction index forward by 8 days so the prediction line plots
     # at the correct future date (predictions are made "today" but refer to day+8)
-    sample_pred_full.index = sample_pred_full.index + pd.Timedelta(days=8)
+    sample_pred_full.index = sample_pred_full.index + pd.Timedelta(days=forecast_horizon)
 
     # Chart 1: Forecast intervals (actual vs predicted with confidence band)
     plot_forecast_intervals(
